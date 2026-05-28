@@ -1,43 +1,72 @@
 # syntax=docker/dockerfile:1
-FROM vastai/linux-desktop:cuda-12.6-ubuntu-22.04
+ARG RUNTIME_IMAGE=vastai/base-image:cuda-12.4.1-auto
 
+FROM mambaorg/micromamba:1.5.8 AS placer-env
+
+USER root
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLACER_HOME=/opt/placer \
+    MAMBA_ROOT_PREFIX=/opt/conda \
     PLACER_ENV=/opt/conda/envs/placer
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
-        wget \
         build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
- && bash /tmp/miniconda.sh -b -p /opt/conda \
- && rm /tmp/miniconda.sh
+RUN micromamba create -y -p "${PLACER_ENV}" \
+        -c pytorch \
+        -c nvidia \
+        -c dglteam/label/th23_cu121 \
+        -c conda-forge \
+        python=3.10 \
+        pytorch=2.3.1 \
+        pytorch-cuda=12.1 \
+        dgl=2.4.0 \
+        opt_einsum=3.4.0 \
+        openbabel=3.1.1 \
+        networkx=3.4.2 \
+        numpy=2.2.1 \
+        pandas=2.2.3 \
+        scipy \
+        e3nn=0.5.4 \
+        pip \
+ && micromamba clean -a -y
 
-ENV PATH="/opt/conda/bin:${PATH}"
+ENV PATH="${PLACER_ENV}/bin:${PATH}"
 
-RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
- && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
- && conda install --solver=classic -n base -y -c conda-forge mamba \
- && conda clean -a -y
+RUN python -m pip install --no-cache-dir \
+        "se3-transformer @ git+https://github.com/NVIDIA/DeepLearningExamples.git#subdirectory=DGLPyTorch/DrugDiscovery/SE3Transformer" \
+ && find "${PLACER_ENV}" -type d -name "__pycache__" -prune -exec rm -rf {} + \
+ && find "${PLACER_ENV}" -type f -name "*.pyc" -delete \
+ && find "${PLACER_ENV}" -type f -name "*.a" -delete \
+ && rm -rf \
+        "${MAMBA_ROOT_PREFIX}/pkgs" \
+        /root/.cache \
+        /tmp/*
 
-WORKDIR ${PLACER_HOME}
-COPY envs/placer_env_lite.yml /tmp/placer_env_lite.yml
-RUN mamba env create -f /tmp/placer_env_lite.yml --prefix "${PLACER_ENV}" \
- && conda clean -a -y \
- && rm /tmp/placer_env_lite.yml
+FROM ${RUNTIME_IMAGE}
 
-ENV PATH="${PLACER_ENV}/bin:/opt/conda/bin:${PATH}" \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DGLBACKEND=pytorch \
+    PLACER_HOME=/opt/placer \
+    PLACER_ENV=/opt/conda/envs/placer
+
+ENV PATH="${PLACER_ENV}/bin:${PATH}" \
     CONDA_PREFIX="${PLACER_ENV}" \
     CONDA_DEFAULT_ENV=placer \
     PYTHONPATH="${PLACER_HOME}"
 
-COPY . ${PLACER_HOME}
+COPY --from=placer-env ${PLACER_ENV} ${PLACER_ENV}
+
+WORKDIR ${PLACER_HOME}
+COPY PLACER.py run_PLACER.py LICENSE README.md ${PLACER_HOME}/
+COPY modules ${PLACER_HOME}/modules
+COPY data ${PLACER_HOME}/data
+COPY weights ${PLACER_HOME}/weights
 
 RUN echo "${PLACER_HOME}" > "${PLACER_ENV}/lib/python3.10/site-packages/placer_repo.pth" \
  && printf '%s\n' \
@@ -51,26 +80,16 @@ RUN test -s "${PLACER_HOME}/weights/PLACER_model_1.pt" \
  && test -s "${PLACER_HOME}/data/ligands.json.gz" \
  && test -s "${PLACER_HOME}/data/test.csv" \
  && /usr/local/bin/placer --help >/dev/null \
- && "${PLACER_ENV}/bin/python" - <<'PY'
-import torch
-import dgl
-from openbabel import openbabel
-import PLACER
+ && "${PLACER_ENV}/bin/python" -c 'import torch; import dgl; from openbabel import openbabel; import PLACER; print("torch", torch.__version__, "cuda", torch.version.cuda); print("dgl", dgl.__version__); print("placer", PLACER.__file__)' \
+ && find "${PLACER_ENV}" "${PLACER_HOME}" -type d -name "__pycache__" -prune -exec rm -rf {} + \
+ && find "${PLACER_ENV}" "${PLACER_HOME}" -type f -name "*.pyc" -delete
 
-print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("dgl", dgl.__version__)
-print("placer", PLACER.__file__)
-PY
-
-RUN /opt/conda/bin/conda init bash \
- && printf '%s\n' \
-      'conda activate placer' \
-      >> /root/.bashrc \
- && printf '%s\n' \
+RUN printf '%s\n' \
       "PATH=${PATH}" \
       "CONDA_PREFIX=${CONDA_PREFIX}" \
       "CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV}" \
       "PYTHONPATH=${PYTHONPATH}" \
+      "DGLBACKEND=${DGLBACKEND}" \
       "PLACER_HOME=${PLACER_HOME}" \
       >> /etc/environment
 
