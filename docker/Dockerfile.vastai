@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+FROM vastai/linux-desktop:cuda-12.6-ubuntu-22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLACER_HOME=/opt/placer \
+    PLACER_ENV=/opt/conda/envs/placer
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        wget \
+        build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+ && bash /tmp/miniconda.sh -b -p /opt/conda \
+ && rm /tmp/miniconda.sh
+
+ENV PATH="${PLACER_ENV}/bin:/opt/conda/bin:${PATH}" \
+    CONDA_PREFIX="${PLACER_ENV}" \
+    CONDA_DEFAULT_ENV=placer \
+    PYTHONPATH="${PLACER_HOME}"
+
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
+ && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
+ && conda install -n base -y -c conda-forge mamba \
+ && conda clean -a -y
+
+WORKDIR ${PLACER_HOME}
+COPY envs/placer_env_lite.yml /tmp/placer_env_lite.yml
+RUN mamba env create -f /tmp/placer_env_lite.yml --prefix "${PLACER_ENV}" \
+ && conda clean -a -y \
+ && rm /tmp/placer_env_lite.yml
+
+COPY . ${PLACER_HOME}
+
+RUN echo "${PLACER_HOME}" > "${PLACER_ENV}/lib/python3.10/site-packages/placer_repo.pth" \
+ && printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'exec /opt/conda/envs/placer/bin/python /opt/placer/run_PLACER.py "$@"' \
+      > /usr/local/bin/placer \
+ && chmod +x /usr/local/bin/placer
+
+RUN test -s "${PLACER_HOME}/weights/PLACER_model_1.pt" \
+ && test -s "${PLACER_HOME}/data/ligands.json.gz" \
+ && test -s "${PLACER_HOME}/data/test.csv" \
+ && /usr/local/bin/placer --help >/dev/null \
+ && "${PLACER_ENV}/bin/python" - <<'PY'
+import torch
+import dgl
+from openbabel import openbabel
+import PLACER
+
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+print("dgl", dgl.__version__)
+print("placer", PLACER.__file__)
+PY
+
+RUN /opt/conda/bin/conda init bash \
+ && printf '%s\n' \
+      'conda activate placer' \
+      >> /root/.bashrc \
+ && printf '%s\n' \
+      "PATH=${PATH}" \
+      "CONDA_PREFIX=${CONDA_PREFIX}" \
+      "CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV}" \
+      "PYTHONPATH=${PYTHONPATH}" \
+      "PLACER_HOME=${PLACER_HOME}" \
+      >> /etc/environment
+
+WORKDIR /workspace
+CMD ["placer", "--help"]
