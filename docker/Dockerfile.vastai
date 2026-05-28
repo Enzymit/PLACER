@@ -23,7 +23,7 @@ ENV PATH="/opt/conda/bin:${PATH}"
 
 RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
  && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
- && conda install -n base -y -c conda-forge mamba \
+ && conda install --solver=classic -n base -y -c conda-forge mamba \
  && conda clean -a -y
 
 WORKDIR ${PLACER_HOME}
