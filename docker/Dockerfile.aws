@@ -1,0 +1,147 @@
+# syntax=docker/dockerfile:1
+
+# CUDA 12.6 is supported by the AWS workers and is backward-compatible with
+# the CUDA 12.8 drivers used by the Vast workers.  PLACER itself keeps the
+# upstream CUDA 12.1 PyTorch/DGL environment below.
+ARG RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+
+FROM mambaorg/micromamba:1.5.8 AS placer-env
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive \
+    MAMBA_ROOT_PREFIX=/opt/conda \
+    PLACER_ENV=/opt/conda/envs/placer
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Keep the PLACER dependency set identical to the tested Vast image.  The
+# CUDA 12.1 runtime shipped in this environment runs on newer host drivers.
+RUN micromamba create -y -p "${PLACER_ENV}" \
+        -c pytorch \
+        -c nvidia \
+        -c dglteam/label/th23_cu121 \
+        -c conda-forge \
+        python=3.10 \
+        pytorch=2.3.1 \
+        pytorch-cuda=12.1 \
+        dgl=2.4.0 \
+        opt_einsum=3.4.0 \
+        openbabel=3.1.1 \
+        networkx=3.4.2 \
+        numpy=2.2.1 \
+        pandas=2.2.3 \
+        scipy \
+        e3nn=0.5.4 \
+        pip \
+ && micromamba clean -a -y
+
+ENV PATH="${PLACER_ENV}/bin:${PATH}"
+
+RUN python -m pip install --no-cache-dir \
+        "se3-transformer @ git+https://github.com/NVIDIA/DeepLearningExamples.git#subdirectory=DGLPyTorch/DrugDiscovery/SE3Transformer" \
+ && find "${PLACER_ENV}" -type d -name "__pycache__" -prune -exec rm -rf {} + \
+ && find "${PLACER_ENV}" -type f -name "*.pyc" -delete \
+ && find "${PLACER_ENV}" -type f -name "*.a" -delete \
+ && rm -rf \
+        "${MAMBA_ROOT_PREFIX}/pkgs" \
+        /root/.cache \
+        /tmp/*
+
+FROM ${RUNTIME_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DGLBACKEND=pytorch \
+    PLACER_HOME=/opt/placer \
+    PLACER_ENV=/opt/conda/envs/placer \
+    CUDA_HOME=/usr/local/cuda
+
+# Do not put the conda lib directory first: it contains OpenSSL libraries
+# that can break the system OpenSSH daemon used by SkyPilot/Vast.
+ENV PATH="${PLACER_ENV}/bin:${PATH}" \
+    CONDA_PREFIX="${PLACER_ENV}" \
+    CONDA_DEFAULT_ENV=placer \
+    PYTHONPATH="${PLACER_HOME}" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64"
+
+# SkyPilot connects to Docker workers over SSH after starting the container.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        libgomp1 \
+        openssh-client \
+        openssh-server \
+        rsync \
+        tmux \
+        unzip \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
+ && chmod 700 /root/.ssh \
+ && printf '%s\n' \
+        'PermitRootLogin prohibit-password' \
+        'PubkeyAuthentication yes' \
+        'PasswordAuthentication no' \
+        > /etc/ssh/sshd_config.d/99-skypilot.conf
+
+# Vast's injected port-forward bootstrap expects this marker to exist in
+# images that do not inherit vastai/base-image.
+RUN touch /etc/forward_port2
+
+# Install AWS CLI v2 directly; Ubuntu's awscli package is not consistently
+# available in the CUDA runtime repositories used by both providers.
+RUN curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
+        -o /tmp/awscliv2.zip \
+ && unzip -q /tmp/awscliv2.zip -d /tmp \
+ && /tmp/aws/install --update \
+ && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+COPY --from=placer-env ${PLACER_ENV} ${PLACER_ENV}
+
+WORKDIR ${PLACER_HOME}
+COPY PLACER.py run_PLACER.py LICENSE README.md ${PLACER_HOME}/
+COPY modules ${PLACER_HOME}/modules
+COPY data ${PLACER_HOME}/data
+COPY weights ${PLACER_HOME}/weights
+
+RUN echo "${PLACER_HOME}" > "${PLACER_ENV}/lib/python3.10/site-packages/placer_repo.pth" \
+ && printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'exec /opt/conda/envs/placer/bin/python /opt/placer/run_PLACER.py "$@"' \
+      > /usr/local/bin/placer \
+ && chmod +x /usr/local/bin/placer
+
+RUN test -s "${PLACER_HOME}/weights/PLACER_model_1.pt" \
+ && test -s "${PLACER_HOME}/data/ligands.json.gz" \
+ && test -s "${PLACER_HOME}/data/test.csv" \
+ && aws --version \
+ && /usr/bin/ssh -V \
+ && tmux -V \
+ && /usr/local/bin/placer --help >/dev/null \
+ && "${PLACER_ENV}/bin/python" -c 'import torch; import dgl; from openbabel import openbabel; import PLACER; assert torch.version.cuda == "12.1", torch.version.cuda; print("torch", torch.__version__, "cuda", torch.version.cuda); print("dgl", dgl.__version__); print("placer", PLACER.__file__)' \
+ && find "${PLACER_ENV}" "${PLACER_HOME}" -type d -name "__pycache__" -prune -exec rm -rf {} + \
+ && find "${PLACER_ENV}" "${PLACER_HOME}" -type f -name "*.pyc" -delete
+
+RUN printf '%s\n' \
+      "PATH=${PATH}" \
+      "CONDA_PREFIX=${CONDA_PREFIX}" \
+      "CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV}" \
+      "PYTHONPATH=${PYTHONPATH}" \
+      "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" \
+      "DGLBACKEND=${DGLBACKEND}" \
+      "PLACER_HOME=${PLACER_HOME}" \
+      >> /etc/environment
+
+WORKDIR /workspace
+CMD ["bash", "-lc", "mkdir -p /run/sshd && ssh-keygen -A && exec /usr/sbin/sshd -D -e"]
